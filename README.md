@@ -35,8 +35,8 @@
 
 ### Bước 1: Clone kho mã nguồn về máy
 ```bash
-git clone https://github.com/binc95145-hue/CAMS-Nhom6.git
-cd CAMS-Nhom6
+git clone https://github.com/huyhoang28012005-create/Nhom6_project.git
+cd Nhom6_project
 ```
 
 ### Bước 2: Thiết lập Backend (Python)
