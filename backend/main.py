@@ -1,5 +1,15 @@
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    status,
+    UploadFile,
+    File,
+)
+
+from datetime import time
+from excel_service import read_timetable_excel
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -13,6 +23,9 @@ from schemas import (
     TimetableSessionCreate,
     TimetableSessionResponse,
 )
+from io import BytesIO
+from openpyxl import Workbook
+from fastapi.responses import StreamingResponse
 
 
 # Tạo bảng trong database nếu bảng chưa tồn tại
@@ -389,5 +402,483 @@ def create_timetable_session(
         )
 
     return session
+
+# ==========================================
+# CẬP NHẬT BUỔI HỌC
+# ==========================================
+
+@app.put(
+    "/api/timetable/sessions/{session_id}",
+    response_model=TimetableSessionResponse,
+)
+def update_timetable_session(
+    session_id: int,
+    session_data: TimetableSessionCreate,
+    db: Session = Depends(get_db),
+):
+    # 1. Kiểm tra buổi học có tồn tại không
+    session = db.query(TimetableSession).filter(
+        TimetableSession.id == session_id
+    ).first()
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Không tìm thấy buổi học",
+        )
+
+    # 2. Kiểm tra lớp học phần có tồn tại không
+    course_class = db.query(CourseClass).filter(
+        CourseClass.id == session_data.class_id
+    ).first()
+
+    if course_class is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Không tìm thấy lớp học phần",
+        )
+
+    # 3. Nếu có chỉ định phòng học thì kiểm tra phòng
+    if session_data.room_id is not None:
+
+        room = db.query(Room).filter(
+            Room.id == session_data.room_id
+        ).first()
+
+        if room is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Không tìm thấy phòng học",
+            )
+
+        # 4. Kiểm tra sức chứa
+        if room.capacity < course_class.student_count:
+            raise HTTPException(
+                status_code=409,
+                detail="Sức chứa phòng không đủ cho lớp học",
+            )
+
+        # 5. Kiểm tra loại phòng
+        if room.room_type != course_class.required_room_type:
+            raise HTTPException(
+                status_code=409,
+                detail="Loại phòng không phù hợp với lớp học",
+            )
+
+        # 6. Kiểm tra thiết bị
+        required_equipment = {
+            item.strip().casefold()
+            for item in (
+                course_class.required_equipment or ""
+            ).split(",")
+            if item.strip()
+        }
+
+        available_equipment = {
+            item.strip().casefold()
+            for item in (room.equipment or "").split(",")
+            if item.strip()
+        }
+
+        missing_equipment = (
+            required_equipment - available_equipment
+        )
+
+        if missing_equipment:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Phòng học thiếu thiết bị yêu cầu: "
+                    + ", ".join(sorted(missing_equipment))
+                ),
+            )
+
+        # 7. Kiểm tra trùng lịch phòng
+        # Loại trừ chính buổi học đang được cập nhật
+        conflict = db.query(TimetableSession).filter(
+            TimetableSession.id != session_id,
+            TimetableSession.room_id == session_data.room_id,
+            TimetableSession.weekday == session_data.weekday,
+            TimetableSession.start_time < session_data.end_time,
+            TimetableSession.end_time > session_data.start_time,
+        ).first()
+
+        if conflict is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Phòng học đã có lịch vào khoảng thời gian này",
+            )
+
+    # 8. Cập nhật thông tin buổi học
+    for field, value in session_data.model_dump().items():
+        setattr(session, field, value)
+
+    try:
+        db.commit()
+        db.refresh(session)
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Dữ liệu buổi học vi phạm ràng buộc database",
+        )
+
+    return session
+
+# ==========================================
+# XÓA BUỔI HỌC
+# ==========================================
+
+@app.delete("/api/timetable/sessions/{session_id}")
+def delete_timetable_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+):
+    # Kiểm tra buổi học có tồn tại không
+    session = db.query(TimetableSession).filter(
+        TimetableSession.id == session_id
+    ).first()
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Không tìm thấy buổi học",
+        )
+
+    # Xóa buổi học khỏi database
+    db.delete(session)
+    db.commit()
+
+    return {
+        "message": "Đã xóa buổi học thành công"
+    }
+
+# ==========================================
+# IMPORT THỜI KHÓA BIỂU TỪ FILE EXCEL
+# ==========================================
+
+@app.post(
+    "/api/timetable/import",
+    status_code=status.HTTP_201_CREATED,
+)
+async def import_timetable_excel(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    # 1. Kiểm tra định dạng file
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=400,
+            detail="Chỉ hỗ trợ file Excel có định dạng .xlsx",
+        )
+
+    # 2. Đọc nội dung file (giới hạn 5 MB)
+    contents = await file.read(5 * 1024 * 1024 + 1)
+
+    if not contents:
+        raise HTTPException(
+            status_code=400,
+            detail="File Excel đang trống",
+        )
+
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="File Excel vượt quá giới hạn 5 MB",
+        )
+
+    # 3. Đọc và kiểm tra dữ liệu Excel
+    result = read_timetable_excel(contents)
+
+    if result["errors"]:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "File Excel có dữ liệu không hợp lệ",
+                "errors": result["errors"],
+            },
+        )
+
+    if not result["rows"]:
+        raise HTTPException(
+            status_code=422,
+            detail="File Excel không có dữ liệu thời khóa biểu",
+        )
+
+    # 4. Chuẩn bị dữ liệu và kiểm tra các ràng buộc
+    sessions_to_create = []
+    errors = []
+
+    for row_number, row in enumerate(result["rows"], start=2):
+
+        # Kiểm tra lớp học phần
+        course_class = db.query(CourseClass).filter(
+            CourseClass.class_code == row["class_code"]
+        ).first()
+
+        if course_class is None:
+            errors.append({
+                "row": row_number,
+                "message": (
+                    f"Không tìm thấy lớp học phần "
+                    f"{row['class_code']}"
+                ),
+            })
+            continue
+
+        room = None
+        room_code = row["room_code"]
+
+        # Kiểm tra phòng nếu Excel có chỉ định phòng
+        if room_code:
+            room = db.query(Room).filter(
+                Room.room_code == room_code
+            ).first()
+
+            if room is None:
+                errors.append({
+                    "row": row_number,
+                    "message": f"Không tìm thấy phòng {room_code}",
+                })
+                continue
+
+            # Kiểm tra sức chứa
+            if room.capacity < course_class.student_count:
+                errors.append({
+                    "row": row_number,
+                    "message": f"Phòng {room_code} không đủ sức chứa",
+                })
+                continue
+
+            # Kiểm tra loại phòng
+            if room.room_type != course_class.required_room_type:
+                errors.append({
+                    "row": row_number,
+                    "message": f"Phòng {room_code} không đúng loại phòng",
+                })
+                continue
+
+            # Kiểm tra thiết bị
+            required_equipment = {
+                item.strip().casefold()
+                for item in (
+                    course_class.required_equipment or ""
+                ).split(",")
+                if item.strip()
+            }
+
+            available_equipment = {
+                item.strip().casefold()
+                for item in (room.equipment or "").split(",")
+                if item.strip()
+            }
+
+            missing_equipment = (
+                required_equipment - available_equipment
+            )
+
+            if missing_equipment:
+                errors.append({
+                    "row": row_number,
+                    "message": (
+                        f"Phòng {room_code} thiếu thiết bị: "
+                        + ", ".join(sorted(missing_equipment))
+                    ),
+                })
+                continue
+
+        # Chuyển thời gian thành đối tượng time
+        start_time = time.fromisoformat(row["start_time"])
+        end_time = time.fromisoformat(row["end_time"])
+
+        # Kiểm tra trùng lịch với dữ liệu đã có trong database
+        if room is not None:
+            conflict = db.query(TimetableSession).filter(
+                TimetableSession.room_id == room.id,
+                TimetableSession.weekday == row["weekday"],
+                TimetableSession.start_time < end_time,
+                TimetableSession.end_time > start_time,
+            ).first()
+
+            if conflict is not None:
+                errors.append({
+                    "row": row_number,
+                    "message": (
+                        f"Phòng {room_code} đã có lịch "
+                        "trong khoảng thời gian này"
+                    ),
+                })
+                continue
+
+            # Kiểm tra trùng lịch giữa các dòng trong cùng file Excel
+            batch_conflict = any(
+                previous.room_id == room.id
+                and previous.weekday == row["weekday"]
+                and previous.start_time < end_time
+                and previous.end_time > start_time
+                for previous in sessions_to_create
+            )
+
+            if batch_conflict:
+                errors.append({
+                    "row": row_number,
+                    "message": (
+                        f"Phòng {room_code} bị trùng lịch "
+                        "với một dòng khác trong file Excel"
+                    ),
+                })
+                continue
+
+        # Chuẩn bị buổi học
+        session = TimetableSession(
+            class_id=course_class.id,
+            weekday=row["weekday"],
+            start_time=start_time,
+            end_time=end_time,
+            room_id=room.id if room is not None else None,
+        )
+
+        sessions_to_create.append(session)
+
+    # 5. Nếu có lỗi thì từ chối toàn bộ file
+    if errors:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Có dữ liệu không hợp lệ. Không có buổi học nào được nhập.",
+                "errors": errors,
+            },
+        )
+
+    # 6. Lưu toàn bộ dữ liệu hợp lệ vào database
+    db.add_all(sessions_to_create)
+
+    try:
+        db.commit()
+
+        for session in sessions_to_create:
+            db.refresh(session)
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Dữ liệu Excel vi phạm ràng buộc database",
+        )
+
+    # 7. Trả kết quả
+    return {
+        "message": "Nhập thời khóa biểu từ Excel thành công",
+        "imported_count": len(sessions_to_create),
+        "sessions": [
+            {
+                "id": session.id,
+                "class_id": session.class_id,
+                "weekday": session.weekday,
+                "start_time": session.start_time.strftime("%H:%M:%S"),
+                "end_time": session.end_time.strftime("%H:%M:%S"),
+                "room_id": session.room_id,
+            }
+            for session in sessions_to_create
+        ],
+    }
+
+# ==========================================
+# EXPORT THỜI KHÓA BIỂU RA FILE EXCEL
+# ==========================================
+
+@app.get(
+    "/api/timetable/export",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                    "schema": {
+                        "type": "string",
+                        "format": "binary",
+                    }
+                }
+            },
+            "description": "File Excel thời khóa biểu",
+        }
+    },
+)
+def export_timetable_excel(
+    db: Session = Depends(get_db),
+):
+    # 1. Lấy dữ liệu buổi học, lớp học phần và phòng học
+    sessions = (
+        db.query(TimetableSession, CourseClass, Room)
+        .join(
+            CourseClass,
+            TimetableSession.class_id == CourseClass.id,
+        )
+        .outerjoin(
+            Room,
+            TimetableSession.room_id == Room.id,
+        )
+        .order_by(
+            TimetableSession.weekday,
+            TimetableSession.start_time,
+        )
+        .all()
+    )
+
+    # 2. Tạo workbook Excel
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Timetable"
+
+    # 3. Tạo tiêu đề cột
+    worksheet.append([
+        "class_code",
+        "weekday",
+        "start_time",
+        "end_time",
+        "room_code",
+    ])
+
+    # 4. Ghi dữ liệu vào Excel
+    for session, course_class, room in sessions:
+        worksheet.append([
+            course_class.class_code,
+            session.weekday,
+            session.start_time.strftime("%H:%M:%S"),
+            session.end_time.strftime("%H:%M:%S"),
+            room.room_code if room else "",
+        ])
+
+    # 5. Định dạng bảng
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+
+    worksheet.column_dimensions["A"].width = 20
+    worksheet.column_dimensions["B"].width = 12
+    worksheet.column_dimensions["C"].width = 15
+    worksheet.column_dimensions["D"].width = 15
+    worksheet.column_dimensions["E"].width = 18
+
+    # 6. Lưu workbook vào bộ nhớ
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+
+    # 7. Trả file Excel cho người dùng tải xuống
+    return StreamingResponse(
+        output,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="CAMS_timetable_export.xlsx"'
+            )
+        },
+    )
+
+
 
 
