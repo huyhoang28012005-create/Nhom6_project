@@ -7,7 +7,7 @@ from openpyxl import load_workbook
 
 # Các cột bắt buộc trong file Excel
 REQUIRED_COLUMNS = [
-    "class_code",
+    "course_name",
     "weekday",
     "start_time",
     "end_time",
@@ -152,13 +152,14 @@ def read_timetable_excel(file_content: bytes):
             ):
                 continue
 
+           
             try:
-                class_code = values[
-                    column_positions["class_code"]
+                course_name = values[
+                    column_positions["course_name"]
                 ]
 
-                if class_code is None or not str(class_code).strip():
-                    raise ValueError("Mã lớp học phần không được để trống")
+                if course_name is None or not str(course_name).strip():
+                    raise ValueError("Tên môn học không được để trống")
 
                 weekday = parse_weekday(
                     values[column_positions["weekday"]]
@@ -185,7 +186,7 @@ def read_timetable_excel(file_content: bytes):
                     room_code = str(room_code).strip() or None
 
                 rows.append({
-                    "class_code": str(class_code).strip(),
+                    "course_name": str(course_name).strip(),
                     "weekday": weekday,
                     "start_time": start_time,
                     "end_time": end_time,

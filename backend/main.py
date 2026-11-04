@@ -562,6 +562,7 @@ def delete_timetable_session(
     "/api/timetable/import",
     status_code=status.HTTP_201_CREATED,
 )
+
 async def import_timetable_excel(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -606,31 +607,83 @@ async def import_timetable_excel(
             detail="File Excel không có dữ liệu thời khóa biểu",
         )
 
-    # 4. Chuẩn bị dữ liệu và kiểm tra các ràng buộc
+    # 4. Chuẩn bị dữ liệu
     sessions_to_create = []
     errors = []
 
+    # Duyệt từng dòng trong file Excel
     for row_number, row in enumerate(result["rows"], start=2):
 
-        # Kiểm tra lớp học phần
-        course_class = db.query(CourseClass).filter(
-            CourseClass.class_code == row["class_code"]
-        ).first()
+        # 4.1. Kiểm tra và tìm lớp học phần theo tên môn học
+        matched_classes = db.query(CourseClass).filter(
+            CourseClass.course_name == row["course_name"].strip()
+        ).all()
 
-        if course_class is None:
+        if len(matched_classes) == 0:
+            errors.append({
+                "row": row_number,
+                "message": f"Không tìm thấy môn học {row['course_name']}",
+            })
+            continue
+
+        if len(matched_classes) > 1:
             errors.append({
                 "row": row_number,
                 "message": (
-                    f"Không tìm thấy lớp học phần "
-                    f"{row['class_code']}"
+                    f"Tên môn học {row['course_name']} "
+                    "khớp với nhiều lớp học phần. "
+                    "Cần bổ sung mã lớp hoặc nhóm lớp để phân biệt."
                 ),
             })
             continue
 
+        course_class = matched_classes[0]
+
+        # 4.2. Chuyển đổi thời gian
+        start_time = time.fromisoformat(row["start_time"])
+        end_time = time.fromisoformat(row["end_time"])
+
+        # 4.3. Kiểm tra trùng lịch của lớp trong database
+        class_conflict = db.query(TimetableSession).filter(
+            TimetableSession.class_id == course_class.id,
+            TimetableSession.weekday == row["weekday"],
+            TimetableSession.start_time < end_time,
+            TimetableSession.end_time > start_time,
+        ).first()
+
+        if class_conflict is not None:
+            errors.append({
+                "row": row_number,
+                "message": (
+                    f"Môn học {row['course_name']} "
+                    "đã có lịch trong khoảng thời gian này"
+                ),
+            })
+            continue
+
+        # 4.4. Kiểm tra trùng lịch lớp giữa các dòng Excel
+        batch_class_conflict = any(
+            previous.class_id == course_class.id
+            and previous.weekday == row["weekday"]
+            and previous.start_time < end_time
+            and previous.end_time > start_time
+            for previous in sessions_to_create
+        )
+
+        if batch_class_conflict:
+            errors.append({
+                "row": row_number,
+                "message": (
+                    f"Môn học {row['course_name']} "
+                    "bị trùng lịch với dòng khác trong file Excel"
+                ),
+            })
+            continue
+
+        # 4.5. Kiểm tra phòng học nếu Excel có chỉ định phòng
         room = None
         room_code = row["room_code"]
 
-        # Kiểm tra phòng nếu Excel có chỉ định phòng
         if room_code:
             room = db.query(Room).filter(
                 Room.room_code == room_code
@@ -688,20 +741,15 @@ async def import_timetable_excel(
                 })
                 continue
 
-        # Chuyển thời gian thành đối tượng time
-        start_time = time.fromisoformat(row["start_time"])
-        end_time = time.fromisoformat(row["end_time"])
-
-        # Kiểm tra trùng lịch với dữ liệu đã có trong database
-        if room is not None:
-            conflict = db.query(TimetableSession).filter(
+            # Kiểm tra trùng lịch phòng trong database
+            room_conflict = db.query(TimetableSession).filter(
                 TimetableSession.room_id == room.id,
                 TimetableSession.weekday == row["weekday"],
                 TimetableSession.start_time < end_time,
                 TimetableSession.end_time > start_time,
             ).first()
 
-            if conflict is not None:
+            if room_conflict is not None:
                 errors.append({
                     "row": row_number,
                     "message": (
@@ -711,8 +759,8 @@ async def import_timetable_excel(
                 })
                 continue
 
-            # Kiểm tra trùng lịch giữa các dòng trong cùng file Excel
-            batch_conflict = any(
+            # Kiểm tra trùng lịch phòng giữa các dòng Excel
+            batch_room_conflict = any(
                 previous.room_id == room.id
                 and previous.weekday == row["weekday"]
                 and previous.start_time < end_time
@@ -720,7 +768,7 @@ async def import_timetable_excel(
                 for previous in sessions_to_create
             )
 
-            if batch_conflict:
+            if batch_room_conflict:
                 errors.append({
                     "row": row_number,
                     "message": (
@@ -730,7 +778,7 @@ async def import_timetable_excel(
                 })
                 continue
 
-        # Chuẩn bị buổi học
+        # 4.6. Chuẩn bị buổi học
         session = TimetableSession(
             class_id=course_class.id,
             weekday=row["weekday"],
@@ -746,7 +794,10 @@ async def import_timetable_excel(
         raise HTTPException(
             status_code=422,
             detail={
-                "message": "Có dữ liệu không hợp lệ. Không có buổi học nào được nhập.",
+                "message": (
+                    "Có dữ liệu không hợp lệ. "
+                    "Không có buổi học nào được nhập."
+                ),
                 "errors": errors,
             },
         )
@@ -783,6 +834,7 @@ async def import_timetable_excel(
             for session in sessions_to_create
         ],
     }
+
 
 # ==========================================
 # EXPORT THỜI KHÓA BIỂU RA FILE EXCEL
@@ -833,12 +885,12 @@ def export_timetable_excel(
 
     # 3. Tạo tiêu đề cột
     worksheet.append([
-        "class_code",
-        "weekday",
-        "start_time",
-        "end_time",
-        "room_code",
-    ])
+    "course_name",
+    "weekday",
+    "start_time",
+    "end_time",
+    "room_code",
+])
 
     # 4. Ghi dữ liệu vào Excel
     for session, course_class, room in sessions:
@@ -874,7 +926,7 @@ def export_timetable_excel(
         ),
         headers={
             "Content-Disposition": (
-                'attachment; filename="CAMS_timetable_export.xlsx"'
+                'attachmendef export_timetable_excelt; filename="CAMS_timetable_export.xlsx"'
             )
         },
     )
