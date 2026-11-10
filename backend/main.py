@@ -26,6 +26,8 @@ from schemas import (
 from io import BytesIO
 from openpyxl import Workbook
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from auth import auth_router
 
 
 # Tạo bảng trong database nếu bảng chưa tồn tại
@@ -36,6 +38,18 @@ app = FastAPI(
     description="API quản lý phòng học và thời khóa biểu",
     version="0.1.0",
 )
+
+# 1. Cấu hình CORS cho phép Frontend gọi API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 2. Đăng ký phân hệ Xác thực & Phân quyền RBAC 04 vai trò (Đặng Huy Hoàng)
+app.include_router(auth_router)
 
 
 @app.get("/")
@@ -926,7 +940,7 @@ def export_timetable_excel(
         ),
         headers={
             "Content-Disposition": (
-                'attachmendef export_timetable_excelt; filename="CAMS_timetable_export.xlsx"'
+                'attachment; filename="CAMS_timetable_export.xlsx"'
             )
         },
     )
