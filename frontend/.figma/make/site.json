@@ -1,0 +1,10 @@
+{
+  "description": "Giúp sinh viên Việt Nam xem thời khóa biểu, tìm phòng trống và đặt phòng học, đồng thời theo dõi lịch đặt, thông báo và báo cáo sự cố.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
