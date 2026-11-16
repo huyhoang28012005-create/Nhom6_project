@@ -165,3 +165,5 @@ __pycache__/
 
 # VS Code local settings
 .vscode/
+__pycache__/
+.pytest_cache/

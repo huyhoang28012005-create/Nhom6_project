@@ -26,6 +26,7 @@ from schemas import (
 from io import BytesIO
 from openpyxl import Workbook
 from fastapi.responses import StreamingResponse
+from allocation_router import allocation_router
 
 
 # Tạo bảng trong database nếu bảng chưa tồn tại
@@ -36,6 +37,9 @@ app = FastAPI(
     description="API quản lý phòng học và thời khóa biểu",
     version="0.1.0",
 )
+
+# 3. Auto Allocation Engine + validate dùng chung (Phan Quang Hoàng)
+app.include_router(allocation_router)
 
 
 @app.get("/")

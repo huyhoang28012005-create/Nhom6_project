@@ -5,3 +5,4 @@ sqlalchemy
 openpyxl
 python-dotenv
 python-multipart
+pytest
