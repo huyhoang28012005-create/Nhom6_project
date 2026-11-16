@@ -1,0 +1,10 @@
+@import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&display=swap");
+@theme{--font-serif:"Playfair Display",Georgia,serif;--font-sans:"Be Vietnam Pro",Inter,sans-serif;--color-navy:#1E3A8A;--color-brand:#3B82F6;--color-amber:#F59E0B;--color-ink:#0F172A;--color-mute:#475569;--color-soft:#F1F5F9}
+body{font-family:var(--font-sans);color:#0F172A;background:#F1F5F9}
+html{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+body{font-size:16px;line-height:1.6;letter-spacing:0}
+h1{line-height:1.25;letter-spacing:-.01em}h2,h3{line-height:1.35}
+p{line-height:1.6}p+p{margin-top:.75rem}
+:focus-visible{outline:2px solid #3B82F6;outline-offset:2px}
