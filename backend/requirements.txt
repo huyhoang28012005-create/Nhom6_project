@@ -1,0 +1,8 @@
+
+fastapi
+uvicorn[standard]
+sqlalchemy
+openpyxl
+python-dotenv
+python-multipart
+pytest
