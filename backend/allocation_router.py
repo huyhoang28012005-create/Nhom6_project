@@ -1,4 +1,4 @@
-"""API cho Auto Allocation Engine (Phan Quang Hoàng).
+"""API cho Auto Allocation Engine (Phan Quang Hoàng) - Đã tích hợp RBAC, BR-03 & Audit Log (Đặng Huy Hoàng).
 
 - POST /api/allocation/run       : xếp tự động (mặc định chỉ xem trước, apply=true mới lưu DB)
 - POST /api/allocation/validate  : kiểm tra một phép gán/đổi phòng thủ công bằng cùng hàm validate
@@ -22,8 +22,17 @@ from allocation import (
     parse_equipment,
     validate_assignment,
 )
+from auth import (
+    ROLE_ADMIN,
+    ROLE_LECTURER,
+    ROLE_OFFICER,
+    User,
+    require_role,
+    write_audit_log,
+)
 from database import get_db
-from models import CourseClass, Room, TimetableSession
+from models import CourseClass, Notification, Room, TimetableSession
+from ops_router import check_first_closure
 
 allocation_router = APIRouter(prefix="/api/allocation", tags=["Allocation"])
 
@@ -63,7 +72,6 @@ def _request_dto(s: TimetableSession, c: CourseClass) -> SessionRequest:
         end_time=s.end_time,
         required_room_type=c.required_room_type,
         required_equipment=parse_equipment(c.required_equipment),
-        # CourseClass chưa có cột giảng viên; có cột `lecturer` thì ràng buộc tự bật.
         lecturer=getattr(c, "lecturer", None),
     )
 
@@ -106,8 +114,15 @@ def _result_json(res: AllocationResult, applied: bool) -> dict:
 # ---------- Endpoints ----------
 
 @allocation_router.post("/run")
-def run_allocation(body: RunRequest | None = None, db: Session = Depends(get_db)):
+def run_allocation(
+    body: RunRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role([ROLE_ADMIN, ROLE_OFFICER])),
+):
     body = body or RunRequest()
+
+    if body.apply:
+        check_first_closure(db)
 
     q = db.query(TimetableSession, CourseClass).join(
         CourseClass, CourseClass.id == TimetableSession.class_id
@@ -127,7 +142,6 @@ def run_allocation(body: RunRequest | None = None, db: Session = Depends(get_db)
         targets = [(s, c) for s, c in rows if s.room_id is None]
 
     target_ids = {s.id for s, _ in targets}
-    # Các buổi khác đã có phòng là cố định; buổi đang được xếp lại không tự chặn chính nó.
     existing = [_booking_dto(s, c) for s, c in rows if s.room_id is not None and s.id not in target_ids]
 
     rooms = [_room_dto(r) for r in db.query(Room).all()]
@@ -140,6 +154,26 @@ def run_allocation(body: RunRequest | None = None, db: Session = Depends(get_db)
         by_id = {s.id: s for s, _ in targets}
         for p in result.assigned:
             by_id[p.session_id].room_id = p.room_id
+
+        write_audit_log(
+            db,
+            current_user,
+            action="AUTO_ALLOCATE",
+            target=f"{len(result.assigned)}/{result.summary['total']} buổi học",
+            new_value=", ".join(f"{p.class_code}->{p.room_code}" for p in result.assigned[:6]),
+            reason="Kích hoạt Auto Allocation Engine (Greedy Best-fit)",
+        )
+        db.add(
+            Notification(
+                target_role=None,
+                category="Xếp phòng tự động",
+                tone="g",
+                message=(
+                    f"Phòng Đào tạo vừa hoàn tất xếp phòng tự động cho "
+                    f"{len(result.assigned)}/{result.summary['total']} buổi học."
+                ),
+            )
+        )
         try:
             db.commit()
             applied = True
@@ -151,7 +185,11 @@ def run_allocation(body: RunRequest | None = None, db: Session = Depends(get_db)
 
 
 @allocation_router.post("/validate")
-def validate_manual_assignment(body: ValidateRequest, db: Session = Depends(get_db)):
+def validate_manual_assignment(
+    body: ValidateRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role([ROLE_ADMIN, ROLE_OFFICER, ROLE_LECTURER])),
+):
     """Kiểm tra trước khi đổi phòng thủ công. Cùng `validate_assignment` với thuật toán tự động."""
     session = db.query(TimetableSession).filter(TimetableSession.id == body.session_id).first()
     if session is None:
