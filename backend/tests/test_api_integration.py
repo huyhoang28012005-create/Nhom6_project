@@ -248,3 +248,451 @@ def test_closure_dates_br03_and_student_lookup_stu01(client: TestClient):
     assert lock_cfg.status_code == 200
 
     assert client.post("/api/allocation/run", json={"apply": True}, headers=off_h).status_code == 403
+def test_notifications_are_private_and_read_state_is_per_user(
+    client: TestClient,
+):
+    # 1. Người chưa đăng nhập không được xem hoặc đánh dấu đã đọc
+    assert client.get("/api/notifications").status_code == 401
+    assert client.post("/api/notifications/read-all").status_code == 401
+
+    # 2. Đăng nhập bằng hai tài khoản khác nhau
+    student_headers = auth_header(client, "sv_minhanh")
+    lecturer_headers = auth_header(client, "gv_an")
+
+    # 3. Sinh viên xem được thông báo chung và thông báo riêng của mình
+    student_res = client.get(
+        "/api/notifications",
+        headers=student_headers,
+    )
+    assert student_res.status_code == 200
+
+    student_notifications = student_res.json()
+
+    shared_message = "Cơ sở dữ liệu (INT2211-02)"
+    private_message = "Yêu cầu mượn phòng TV-301"
+
+    student_shared = next(
+        n for n in student_notifications
+        if shared_message in n["message"]
+    )
+    student_private = next(
+        n for n in student_notifications
+        if private_message in n["message"]
+    )
+
+    assert student_shared["is_unread"] is True
+    assert student_private["is_unread"] is True
+
+    # 4. Giảng viên không được xem thông báo riêng của sinh viên
+    lecturer_res = client.get(
+        "/api/notifications",
+        headers=lecturer_headers,
+    )
+    assert lecturer_res.status_code == 200
+
+    lecturer_notifications = lecturer_res.json()
+
+    assert not any(
+        private_message in n["message"]
+        for n in lecturer_notifications
+    )
+
+    lecturer_shared = next(
+        n for n in lecturer_notifications
+        if shared_message in n["message"]
+    )
+    assert lecturer_shared["is_unread"] is True
+
+    # 5. Sinh viên đánh dấu đã đọc thông báo của mình
+    read_res = client.post(
+        "/api/notifications/read-all",
+        headers=student_headers,
+    )
+    assert read_res.status_code == 200
+
+    student_after = client.get(
+        "/api/notifications",
+        headers=student_headers,
+    ).json()
+
+    student_shared_after = next(
+        n for n in student_after
+        if shared_message in n["message"]
+    )
+    assert student_shared_after["is_unread"] is False
+
+    # 6. Trạng thái đọc của giảng viên không bị ảnh hưởng
+    lecturer_after = client.get(
+        "/api/notifications",
+        headers=lecturer_headers,
+    ).json()
+
+    lecturer_shared_after = next(
+        n for n in lecturer_after
+        if shared_message in n["message"]
+    )
+    assert lecturer_shared_after["is_unread"] is True
+def test_booking_history_is_private_by_user_role(client: TestClient):
+    # 1. Người chưa đăng nhập không được xem lịch sử
+    assert client.get("/api/bookings").status_code == 401
+
+    # 2. Đăng nhập bằng bốn tài khoản
+    student_headers = auth_header(client, "sv_minhanh")
+    lecturer_headers = auth_header(client, "gv_an")
+    officer_headers = auth_header(client, "officer01")
+    admin_headers = auth_header(client, "admin")
+
+    # 3. Chọn phòng có sức chứa lớn nhất
+    rooms = client.get("/api/rooms").json()
+    room = max(rooms, key=lambda r: r["capacity"])
+
+    # 4. Sinh viên tạo một yêu cầu đặt phòng
+    student_booking = client.post(
+        "/api/bookings",
+        headers=student_headers,
+        json={
+            "room_id": room["id"],
+            "use_date": "2099-01-01",
+            "shift_label": "TEST_STUDENT",
+            "attendee_count": 2,
+            "purpose": "Kiểm thử lịch sử đặt phòng sinh viên",
+        },
+    )
+    assert student_booking.status_code == 201, student_booking.text
+    student_booking_id = student_booking.json()["id"]
+
+    # 5. Giảng viên tạo một yêu cầu đặt phòng khác
+    lecturer_booking = client.post(
+        "/api/bookings",
+        headers=lecturer_headers,
+        json={
+            "room_id": room["id"],
+            "use_date": "2099-01-02",
+            "shift_label": "TEST_LECTURER",
+            "attendee_count": 2,
+            "purpose": "Kiểm thử lịch sử đặt phòng giảng viên",
+        },
+    )
+    assert lecturer_booking.status_code == 201, lecturer_booking.text
+    lecturer_booking_id = lecturer_booking.json()["id"]
+
+    # 6. Sinh viên chỉ xem được yêu cầu của mình
+    student_history = client.get(
+        "/api/bookings",
+        headers=student_headers,
+    )
+    assert student_history.status_code == 200
+
+    student_ids = {b["id"] for b in student_history.json()}
+
+    assert student_booking_id in student_ids
+    assert lecturer_booking_id not in student_ids
+
+    # 7. Giảng viên chỉ xem được yêu cầu của mình
+    lecturer_history = client.get(
+        "/api/bookings",
+        headers=lecturer_headers,
+    )
+    assert lecturer_history.status_code == 200
+
+    lecturer_ids = {b["id"] for b in lecturer_history.json()}
+
+    assert lecturer_booking_id in lecturer_ids
+    assert student_booking_id not in lecturer_ids
+
+    # 8. Officer xem được cả hai yêu cầu
+    officer_history = client.get(
+        "/api/bookings",
+        headers=officer_headers,
+    )
+    assert officer_history.status_code == 200
+
+    officer_ids = {b["id"] for b in officer_history.json()}
+
+    assert student_booking_id in officer_ids
+    assert lecturer_booking_id in officer_ids
+
+    # 9. Admin xem được cả hai yêu cầu
+    admin_history = client.get(
+        "/api/bookings",
+        headers=admin_headers,
+    )
+    assert admin_history.status_code == 200
+
+    admin_ids = {b["id"] for b in admin_history.json()}
+
+    assert student_booking_id in admin_ids
+    assert lecturer_booking_id in admin_ids
+def test_change_request_list_is_private_by_user_role(client: TestClient):
+    # 1. Người chưa đăng nhập không được xem đơn đổi phòng
+    assert client.get("/api/change-requests").status_code == 401
+
+    # 2. Đăng nhập các tài khoản
+    admin_headers = auth_header(client, "admin")
+    lecturer_headers = auth_header(client, "gv_an")
+    student_headers = auth_header(client, "sv_minhanh")
+    officer_headers = auth_header(client, "officer01")
+
+    # 3. Tạo thêm một tài khoản giảng viên để kiểm tra quyền riêng tư
+    create_other = client.post(
+        "/api/auth/users",
+        headers=admin_headers,
+        json={
+            "username": "gv_other",
+            "password": "123",
+            "full_name": "Giảng viên khác",
+            "role": "LECTURER",
+        },
+    )
+    assert create_other.status_code in (200, 201), create_other.text
+
+    other_lecturer_headers = auth_header(client, "gv_other")
+
+    # 4. Chọn buổi học và phòng phù hợp
+    sessions = client.get("/api/timetable/sessions").json()
+    rooms = {
+        r["room_code"]: r
+        for r in client.get("/api/rooms").json()
+    }
+
+    session = next(
+        s for s in sessions
+        if s["room_id"] == rooms["B1-204"]["id"]
+    )
+
+    # 5. Giảng viên gửi đơn xin đổi phòng
+    response = client.post(
+        "/api/change-requests",
+        headers=lecturer_headers,
+        json={
+            "session_id": session["id"],
+            "requested_room_id": rooms["A2-305"]["id"],
+            "reason": "Cần giảng đường lớn có micro cho buổi thuyết trình",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    request_id = response.json()["id"]
+
+    # 6. Giảng viên gửi đơn chỉ xem được đơn của mình
+    own_requests = client.get(
+        "/api/change-requests",
+        headers=lecturer_headers,
+    )
+    assert own_requests.status_code == 200
+
+    own_ids = {item["id"] for item in own_requests.json()}
+    assert request_id in own_ids
+
+    # 7. Giảng viên khác không xem được đơn của người khác
+    other_requests = client.get(
+        "/api/change-requests",
+        headers=other_lecturer_headers,
+    )
+    assert other_requests.status_code == 200
+
+    other_ids = {item["id"] for item in other_requests.json()}
+    assert request_id not in other_ids
+
+    # 8. Sinh viên nhận danh sách rỗng
+    student_requests = client.get(
+        "/api/change-requests",
+        headers=student_headers,
+    )
+    assert student_requests.status_code == 200
+    assert student_requests.json() == []
+
+    # 9. Officer xem được tất cả
+    officer_requests = client.get(
+        "/api/change-requests",
+        headers=officer_headers,
+    )
+    assert officer_requests.status_code == 200
+    assert request_id in {item["id"] for item in officer_requests.json()}
+
+    # 10. Admin xem được tất cả
+    admin_requests = client.get(
+        "/api/change-requests",
+        headers=admin_headers,
+    )
+    assert admin_requests.status_code == 200
+    assert request_id in {item["id"] for item in admin_requests.json()}
+def test_lecturer_cannot_request_room_change_for_another_lecturer(
+    client: TestClient,
+):
+    lecturer_headers = auth_header(client, "gv_an")
+
+    classes = client.get("/api/classes").json()
+    sessions = client.get("/api/timetable/sessions").json()
+    rooms = client.get("/api/rooms").json()
+
+    class_by_id = {c["id"]: c for c in classes}
+
+    # Tìm buổi học thuộc lớp do giảng viên khác phụ trách.
+    other_session = next(
+        s for s in sessions
+        if class_by_id[s["class_id"]]["lecturer"]
+        != "TS. Nguyễn Văn An"
+    )
+
+    target_room = next(
+        r for r in rooms
+        if r["id"] != other_session["room_id"]
+    )
+
+    response = client.post(
+        "/api/change-requests",
+        headers=lecturer_headers,
+        json={
+            "session_id": other_session["id"],
+            "requested_room_id": target_room["id"],
+            "reason": "Xin đổi phòng cho buổi học này",
+        },
+    )
+
+    assert response.status_code == 403
+    assert "không được phép" in response.json()["detail"].lower()
+def test_issue_reporting_requires_login_and_uses_authenticated_reporter(
+    client: TestClient,
+):
+    # 1. Người chưa đăng nhập không được xem hoặc gửi báo cáo
+    assert client.get("/api/issues").status_code == 401
+
+    anonymous_response = client.post(
+        "/api/issues",
+        json={
+            "room_name": "A2-305",
+            "issue_type": "Thiết bị",
+            "description": "Máy chiếu không hoạt động bình thường",
+        },
+    )
+    assert anonymous_response.status_code == 401
+
+    # 2. Đăng nhập bằng sinh viên và giảng viên
+    student_headers = auth_header(client, "sv_minhanh")
+    lecturer_headers = auth_header(client, "gv_an")
+
+    # 3. Sinh viên gửi báo cáo
+    student_response = client.post(
+        "/api/issues",
+        headers=student_headers,
+        json={
+            "room_name": "A2-305",
+            "issue_type": "Thiết bị",
+            "description": "Máy chiếu phòng học không hoạt động",
+            "reporter_name": "Tên giả mạo",
+        },
+    )
+    assert student_response.status_code == 201, student_response.text
+    student_issue_id = student_response.json()["id"]
+
+    # 4. Giảng viên gửi báo cáo
+    lecturer_response = client.post(
+        "/api/issues",
+        headers=lecturer_headers,
+        json={
+            "room_name": "B1-204",
+            "issue_type": "Điều hòa / điện",
+            "description": "Điều hòa phòng học phát ra tiếng ồn lớn",
+        },
+    )
+    assert lecturer_response.status_code == 201, lecturer_response.text
+    lecturer_issue_id = lecturer_response.json()["id"]
+
+    # 5. Sinh viên xem danh sách và kiểm tra tên người báo cáo
+    student_issues = client.get(
+        "/api/issues",
+        headers=student_headers,
+    )
+    assert student_issues.status_code == 200
+
+    student_item = next(
+        item for item in student_issues.json()
+        if item["id"] == student_issue_id
+    )
+    assert student_item["reporter_name"] == "Nguyễn Minh Anh"
+
+    # 6. Giảng viên cũng xem được danh sách sự cố
+    lecturer_issues = client.get(
+        "/api/issues",
+        headers=lecturer_headers,
+    )
+    assert lecturer_issues.status_code == 200
+
+    lecturer_item = next(
+        item for item in lecturer_issues.json()
+        if item["id"] == lecturer_issue_id
+    )
+    assert lecturer_item["reporter_name"] == "TS. Nguyễn Văn An"
+
+    # 7. Cả hai tài khoản đều thấy được danh sách sự cố chung
+    lecturer_visible_ids = {
+        item["id"] for item in lecturer_issues.json()
+    }
+    assert student_issue_id in lecturer_visible_ids
+def test_issue_status_update_requires_admin_or_officer(
+    client: TestClient,
+):
+    student_headers = auth_header(client, "sv_minhanh")
+    lecturer_headers = auth_header(client, "gv_an")
+    officer_headers = auth_header(client, "officer01")
+    admin_headers = auth_header(client, "admin")
+
+    # Sinh viên tạo báo cáo sự cố
+    created = client.post(
+        "/api/issues",
+        headers=student_headers,
+        json={
+            "room_name": "A2-305",
+            "issue_type": "Thiết bị",
+            "description": "Máy chiếu không hoạt động bình thường",
+        },
+    )
+    assert created.status_code == 201
+
+    issue_id = created.json()["id"]
+    url = f"/api/issues/{issue_id}"
+
+    # Người chưa đăng nhập không được cập nhật
+    assert client.patch(
+        url,
+        json={"status": "IN_PROGRESS"},
+    ).status_code == 401
+
+    # Sinh viên và giảng viên không được cập nhật
+    assert client.patch(
+        url,
+        headers=student_headers,
+        json={"status": "IN_PROGRESS"},
+    ).status_code == 403
+
+    assert client.patch(
+        url,
+        headers=lecturer_headers,
+        json={"status": "IN_PROGRESS"},
+    ).status_code == 403
+
+    # Officer được cập nhật
+    officer_res = client.patch(
+        url,
+        headers=officer_headers,
+        json={"status": "IN_PROGRESS"},
+    )
+    assert officer_res.status_code == 200
+
+    # Admin cũng được cập nhật
+    admin_res = client.patch(
+        url,
+        headers=admin_headers,
+        json={"status": "RESOLVED"},
+    )
+    assert admin_res.status_code == 200
+
+    # Xác nhận trạng thái cuối cùng
+    issues = client.get(
+        "/api/issues",
+        headers=student_headers,
+    ).json()
+
+    issue = next(x for x in issues if x["id"] == issue_id)
+    assert issue["status"] == "RESOLVED"

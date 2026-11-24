@@ -9,6 +9,7 @@ from sqlalchemy import (
     String,
     Text,
     Time,
+    UniqueConstraint,
 )
 
 from database import Base
@@ -229,10 +230,42 @@ class Notification(Base):
     __tablename__ = "notifications"
 
     id = Column(Integer, primary_key=True, index=True)
-    target_role = Column(String(30), nullable=True)  # None = tất cả
+    target_role = Column(String(30), nullable=True)
     target_username = Column(String(50), nullable=True)
     category = Column(String(50), nullable=False)
-    tone = Column(String(10), nullable=False, default="b")  # b, g, r, y
+    tone = Column(String(10), nullable=False, default="b")
     message = Column(Text, nullable=False)
     is_unread = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, default=utcnow, index=True)
+
+
+class NotificationRead(Base):
+    """Lưu trạng thái đã đọc thông báo riêng cho từng người dùng."""
+
+    __tablename__ = "notification_reads"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "notification_id",
+            "user_id",
+            name="uq_notification_reads_notification_user",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    notification_id = Column(
+        Integer,
+        ForeignKey("notifications.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    read_at = Column(DateTime, nullable=False, default=utcnow)

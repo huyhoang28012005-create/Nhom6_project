@@ -46,6 +46,7 @@ from models import (
     CourseClass,
     IssueReport,
     Notification,
+    NotificationRead,
     Room,
     RoomBooking,
     RoomChangeRequest,
@@ -588,19 +589,40 @@ class ReviewDecision(BaseModel):
 def list_change_requests(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
 ):
-    q = db.query(RoomChangeRequest).order_by(RoomChangeRequest.created_at.desc(), RoomChangeRequest.id.desc())
-    if status_filter and status_filter != "ALL":
-        q = q.filter(RoomChangeRequest.status == status_filter.upper())
-    if current_user and current_user.role == ROLE_LECTURER:
+    # Sinh viên không có chức năng xem đơn đổi phòng.
+    # Trả về danh sách rỗng để không làm lỗi Promise.all ở Frontend.
+    if current_user.role == ROLE_STUDENT:
+        return []
+
+    q = db.query(RoomChangeRequest).order_by(
+        RoomChangeRequest.created_at.desc(),
+        RoomChangeRequest.id.desc(),
+    )
+
+    if current_user.role == ROLE_LECTURER:
+        # Giảng viên chỉ xem đơn do tài khoản của mình gửi.
         q = q.filter(
-            (RoomChangeRequest.requester_username == current_user.username)
-            | (RoomChangeRequest.lecturer_name.ilike(f"%{current_user.full_name}%"))
+            RoomChangeRequest.requester_username == current_user.username
+        )
+    elif current_user.role not in (ROLE_ADMIN, ROLE_OFFICER):
+        raise HTTPException(
+            status_code=403,
+            detail="Bạn không có quyền xem danh sách đơn đổi phòng",
+        )
+
+    if status_filter and status_filter != "ALL":
+        q = q.filter(
+            RoomChangeRequest.status == status_filter.upper()
         )
 
     reqs = q.all()
-    rooms_map = {r.id: r for r in db.query(Room).all()}
+
+    rooms_map = {
+        r.id: r for r in db.query(Room).all()
+    }
+
     sessions_map = {
         s.id: (s, c)
         for s, c in db.query(TimetableSession, CourseClass)
@@ -609,11 +631,13 @@ def list_change_requests(
     }
 
     result = []
+
     for item in reqs:
         sc = sessions_map.get(item.session_id)
         old_r = rooms_map.get(item.old_room_id) if item.old_room_id else None
         new_r = rooms_map.get(item.requested_room_id)
         s_obj, c_obj = sc if sc else (None, None)
+
         result.append(
             {
                 "id": item.id,
@@ -623,7 +647,10 @@ def list_change_requests(
                 "student_count": c_obj.student_count if c_obj else 0,
                 "weekday": s_obj.weekday if s_obj else 1,
                 "weekday_label": WEEKDAY_LABELS.get(s_obj.weekday, "") if s_obj else "",
-                "time_range": f"{s_obj.start_time.strftime('%H:%M')} – {s_obj.end_time.strftime('%H:%M')}" if s_obj else "",
+                "time_range": (
+                    f"{s_obj.start_time.strftime('%H:%M')} – "
+                    f"{s_obj.end_time.strftime('%H:%M')}"
+                ) if s_obj else "",
                 "lecturer_name": item.lecturer_name,
                 "old_room_id": item.old_room_id,
                 "old_room_code": old_r.room_code if old_r else "Chưa gán",
@@ -634,9 +661,13 @@ def list_change_requests(
                 "status": item.status,
                 "reject_reason": item.reject_reason,
                 "reviewed_by": item.reviewed_by,
-                "created_at": item.created_at.strftime("%d/%m/%Y %H:%M") if item.created_at else "",
+                "created_at": (
+                    item.created_at.strftime("%d/%m/%Y %H:%M")
+                    if item.created_at else ""
+                ),
             }
         )
+
     return result
 
 
@@ -655,8 +686,30 @@ def create_change_request(
     session = db.query(TimetableSession).filter(TimetableSession.id == body.session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Không tìm thấy buổi học")
-    course = db.query(CourseClass).filter(CourseClass.id == session.class_id).first()
-    new_room = db.query(Room).filter(Room.id == body.requested_room_id).first()
+    course = db.query(CourseClass).filter(
+        CourseClass.id == session.class_id
+    ).first()
+
+    if not course:
+        raise HTTPException(
+            status_code=404,
+            detail="Không tìm thấy lớp học phần",
+        )
+
+    # Giảng viên chỉ được xin đổi phòng cho lớp mình phụ trách.
+    if current_user.role == ROLE_LECTURER:
+        assigned_lecturer = (course.lecturer or "").strip().casefold()
+        requester_name = (current_user.full_name or "").strip().casefold()
+
+        if not assigned_lecturer or assigned_lecturer != requester_name:
+            raise HTTPException(
+                status_code=403,
+                detail="Bạn không được phép xin đổi phòng cho lớp học phần này",
+            )
+
+    new_room = db.query(Room).filter(
+        Room.id == body.requested_room_id
+    ).first()
     if not new_room:
         raise HTTPException(status_code=404, detail="Không tìm thấy phòng học đề nghị")
     if session.room_id == new_room.id:
@@ -857,12 +910,23 @@ class IssueStatusUpdate(BaseModel):
 @ops_router.get("/bookings", summary="Lịch sử đặt/mượn phòng học")
 def list_bookings(
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
 ):
-    q = db.query(RoomBooking, Room).join(Room, Room.id == RoomBooking.room_id)
-    if current_user and current_user.role in (ROLE_STUDENT, ROLE_LECTURER):
-        q = q.filter(RoomBooking.requester_username == current_user.username)
-    rows = q.order_by(RoomBooking.created_at.desc(), RoomBooking.id.desc()).all()
+    q = db.query(RoomBooking, Room).join(
+        Room,
+        Room.id == RoomBooking.room_id,
+    )
+
+    if current_user.role not in (ROLE_ADMIN, ROLE_OFFICER):
+        q = q.filter(
+            RoomBooking.requester_username == current_user.username
+        )
+
+    rows = q.order_by(
+        RoomBooking.created_at.desc(),
+        RoomBooking.id.desc(),
+    ).all()
+
     return [
         {
             "id": b.id,
@@ -976,8 +1040,19 @@ def review_booking(
 
 
 @ops_router.get("/issues", summary="Danh sách báo cáo sự cố phòng học")
-def list_issues(db: Session = Depends(get_db)):
-    rows = db.query(IssueReport).order_by(IssueReport.created_at.desc(), IssueReport.id.desc()).all()
+def list_issues(
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    rows = (
+        db.query(IssueReport)
+        .order_by(
+            IssueReport.created_at.desc(),
+            IssueReport.id.desc(),
+        )
+        .all()
+    )
+
     return [
         {
             "id": x.id,
@@ -987,7 +1062,10 @@ def list_issues(db: Session = Depends(get_db)):
             "issue_type": x.issue_type,
             "description": x.description,
             "status": x.status,
-            "created_at": x.created_at.strftime("%d/%m/%Y %H:%M") if x.created_at else "",
+            "created_at": (
+                x.created_at.strftime("%d/%m/%Y %H:%M")
+                if x.created_at else ""
+            ),
         }
         for x in rows
     ]
@@ -997,20 +1075,25 @@ def list_issues(db: Session = Depends(get_db)):
 def create_issue(
     body: IssueReportCreate,
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
 ):
     issue = IssueReport(
         room_id=body.room_id,
         room_name=body.room_name.strip(),
-        reporter_name=current_user.full_name if current_user else "Sinh viên",
+        reporter_name=current_user.full_name,
         issue_type=body.issue_type.strip(),
         description=body.description.strip(),
         status="RECEIVED",
     )
+
     db.add(issue)
     db.commit()
     db.refresh(issue)
-    return {"message": "Đã gửi báo cáo sự cố thành công", "id": issue.id}
+
+    return {
+        "message": "Đã gửi báo cáo sự cố thành công",
+        "id": issue.id,
+    }
 
 
 @ops_router.patch("/issues/{issue_id}", summary="Cập nhật tiến độ xử lý sự cố")
@@ -1031,34 +1114,85 @@ def update_issue_status(
 @ops_router.get("/notifications", summary="Xem danh sách thông báo (STU-03, LEC-04)")
 def list_notifications(
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
 ):
-    q = db.query(Notification)
-    if current_user:
-        q = q.filter(
-            (Notification.target_username.is_(None) & Notification.target_role.is_(None))
-            | (Notification.target_role == current_user.role)
-            | (Notification.target_username == current_user.username)
+    q = db.query(Notification).filter(
+        (
+            Notification.target_username.is_(None)
+            & Notification.target_role.is_(None)
         )
-    rows = q.order_by(Notification.created_at.desc(), Notification.id.desc()).limit(30).all()
+        | (Notification.target_role == current_user.role)
+        | (Notification.target_username == current_user.username)
+    )
+
+    rows = q.order_by(
+        Notification.created_at.desc(),
+        Notification.id.desc(),
+    ).limit(30).all()
+
+    read_ids = {
+        row[0]
+        for row in db.query(NotificationRead.notification_id)
+        .filter(NotificationRead.user_id == current_user.id)
+        .all()
+    }
+
     return [
         {
             "id": n.id,
             "category": n.category,
             "tone": n.tone,
             "message": n.message,
-            "is_unread": n.is_unread,
-            "created_at": n.created_at.strftime("%d/%m/%Y %H:%M") if n.created_at else "",
+            "is_unread": n.id not in read_ids,
+            "created_at": n.created_at.strftime("%d/%m/%Y %H:%M")
+            if n.created_at else "",
         }
         for n in rows
     ]
 
 
 @ops_router.post("/notifications/read-all", summary="Đánh dấu đã đọc tất cả thông báo")
-def mark_all_notifications_read(db: Session = Depends(get_db)):
-    db.query(Notification).filter(Notification.is_unread == True).update({"is_unread": False})
-    db.commit()
-    return {"message": "Đã đánh dấu đã đọc"}
+def mark_all_notifications_read(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    visible_notifications = db.query(Notification.id).filter(
+        (
+            Notification.target_username.is_(None)
+            & Notification.target_role.is_(None)
+        )
+        | (Notification.target_role == current_user.role)
+        | (Notification.target_username == current_user.username)
+    ).all()
+
+    visible_ids = {row[0] for row in visible_notifications}
+
+    existing_read_ids = {
+        row[0]
+        for row in db.query(NotificationRead.notification_id)
+        .filter(
+            NotificationRead.user_id == current_user.id,
+            NotificationRead.notification_id.in_(visible_ids),
+        )
+        .all()
+    } if visible_ids else set()
+
+    new_reads = [
+        NotificationRead(
+            notification_id=notification_id,
+            user_id=current_user.id,
+        )
+        for notification_id in visible_ids - existing_read_ids
+    ]
+
+    if new_reads:
+        db.add_all(new_reads)
+        db.commit()
+
+    return {
+        "message": "Đã đánh dấu đã đọc",
+        "updated": len(new_reads),
+    }
 
 
 @ops_router.get("/audit-logs", summary="Xem Nhật ký kiểm toán hệ thống bất biến (ADM-05, BR-04)")
