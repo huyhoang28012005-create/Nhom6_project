@@ -3,12 +3,14 @@ Dịch vụ đọc/kiểm tra file Excel (.xlsx) và CSV (.csv) thời khóa bi�
 Tương thích đồng thời:
 - Mẫu chuẩn CAMS (class_code, course_name, lecturer, student_count, weekday, start_time, end_time / shift, room_code)
 - Mẫu cũ theo course_name hoặc class_code
+- Workbook CAMS có nhiều sheet: ưu tiên sheet 'Timetable', không đọc nhầm 'Test_Matrix'.
 """
 
 from __future__ import annotations
 
 import csv
 from datetime import datetime, time
+from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 from typing import Any
 
@@ -109,6 +111,22 @@ WEEKDAY_TEXT_MAP: dict[str, int] = {
 }
 
 
+def _parse_integer_value(value: Any) -> int:
+    """Đọc số nguyên nghiêm ngặt; không âm thầm cắt phần thập phân."""
+    if value is None or isinstance(value, bool):
+        raise ValueError("Giá trị phải là số nguyên")
+
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError("Giá trị phải là số nguyên") from None
+
+    if not number.is_finite() or number != number.to_integral_value():
+        raise ValueError("Giá trị phải là số nguyên")
+
+    return int(number)
+
+
 def parse_time(value: Any) -> str:
     """Chuyển dữ liệu thời gian Excel thành chuỗi HH:MM:SS."""
     if isinstance(value, datetime):
@@ -134,9 +152,9 @@ def parse_time(value: Any) -> str:
 
 
 def parse_weekday(value: Any) -> int:
-    """Chuyển thứ trong tuần thành số nguyên từ 1 đến 7 (1 = Thứ Hai, 7 = Chủ nhật)."""
-    if isinstance(value, bool) or value is None:
-        raise ValueError("Thứ phải là số từ 1 đến 7 (1 = Thứ 2, ..., 7 = CN)")
+    """Chuyển thứ thành số nguyên 1..7 (1 = Thứ Hai, 7 = Chủ nhật)."""
+    if value is None or isinstance(value, bool):
+        raise ValueError("Thứ phải là số nguyên từ 1 đến 7 (hoặc 'Thứ 2'..'CN')")
 
     if isinstance(value, str):
         key = value.strip().casefold()
@@ -144,32 +162,35 @@ def parse_weekday(value: Any) -> int:
             return WEEKDAY_TEXT_MAP[key]
 
     try:
-        number = int(value)
-        if float(value) != number:
-            raise ValueError()
-        if 1 <= number <= 7:
-            return number
-        raise ValueError()
-    except (ValueError, TypeError):
-        raise ValueError("Thứ phải là số nguyên từ 1 đến 7 (hoặc 'Thứ 2'..'CN')")
+        number = _parse_integer_value(value)
+    except ValueError:
+        raise ValueError("Thứ phải là số nguyên từ 1 đến 7 (hoặc 'Thứ 2'..'CN')") from None
+
+    if 1 <= number <= 7:
+        return number
+
+    raise ValueError("Thứ phải là số nguyên từ 1 đến 7 (hoặc 'Thứ 2'..'CN')")
 
 
 def parse_shift(value: Any) -> tuple[str, str]:
-    """Chuyển Ca học (1..9 hoặc 'Ca 1'..'Ca 9') thành cặp (start_time, end_time)."""
+    """Chuyển Ca học (1..9 hoặc 'Ca 1'..'Ca 9') thành giờ bắt đầu/kết thúc."""
     if value is None or isinstance(value, bool):
         raise ValueError("Ca học không hợp lệ (1–9)")
+
     raw = str(value).strip().casefold()
     if raw.startswith("ca"):
         raw = raw.replace("ca", "", 1).strip()
     if "·" in raw:
         raw = raw.split("·", 1)[0].strip()
+
     try:
-        shift_no = int(float(raw))
+        shift_no = _parse_integer_value(raw)
     except ValueError:
-        raise ValueError(f"Ca học '{value}' không hợp lệ (chấp nhận Ca 1 – Ca 9)")
+        raise ValueError(f"Ca học '{value}' không hợp lệ; chỉ chấp nhận số nguyên từ 1 đến 9") from None
 
     if shift_no not in DEFAULT_SHIFT_TIMES:
-        raise ValueError(f"Ca học {shift_no} nằm ngoài phạm vi Ca 1 – Ca 9")
+        raise ValueError(f"Ca học {shift_no} nằm ngoài phạm vi Ca 1–Ca 9")
+
     return DEFAULT_SHIFT_TIMES[shift_no]
 
 
@@ -185,13 +206,17 @@ def _normalize_headers(raw_headers: tuple[Any, ...] | list[Any]) -> dict[str, in
     return positions
 
 
-def _extract_raw_rows(file_content: bytes, filename: str = "timetable.xlsx") -> tuple[list[Any], list[tuple[Any, ...]]]:
+def _extract_raw_rows(
+    file_content: bytes,
+    filename: str = "timetable.xlsx",
+) -> tuple[list[Any], list[tuple[Any, ...]]]:
+    """Đọc CSV hoặc sheet Timetable; nếu workbook cũ không có sheet này thì dùng sheet active."""
     if filename.lower().endswith(".csv"):
         text = file_content.decode("utf-8-sig")
         reader = list(csv.reader(StringIO(text)))
         if not reader:
             return [], []
-        return reader[0], [tuple(r) for r in reader[1:]]
+        return reader[0], [tuple(row) for row in reader[1:]]
 
     workbook = load_workbook(
         filename=BytesIO(file_content),
@@ -199,18 +224,34 @@ def _extract_raw_rows(file_content: bytes, filename: str = "timetable.xlsx") -> 
         data_only=True,
     )
     try:
-        worksheet = workbook.active
+        worksheet = next(
+            (
+                ws
+                for ws in workbook.worksheets
+                if ws.title.strip().casefold() == "timetable"
+            ),
+            None,
+        )
+
+        # Giữ tương thích với các file Excel cũ chỉ có một sheet hoặc chưa đặt tên Timetable.
+        if worksheet is None:
+            worksheet = workbook.active
+
         if worksheet is None:
             raise ValueError("File Excel không có worksheet")
+
         all_rows = list(worksheet.iter_rows(values_only=True))
         if not all_rows:
             return [], []
-        return list(all_rows[0]), list(all_rows[1:])
+        return list(all_rows[0]), [tuple(row) for row in all_rows[1:]]
     finally:
         workbook.close()
 
 
-def read_timetable_excel(file_content: bytes, filename: str = "timetable.xlsx") -> dict[str, list[dict[str, Any]]]:
+def read_timetable_excel(
+    file_content: bytes,
+    filename: str = "timetable.xlsx",
+) -> dict[str, list[dict[str, Any]]]:
     """
     Đọc file Excel (.xlsx) hoặc CSV (.csv) và kiểm tra cấu trúc cơ bản.
     Trả về {"rows": [...], "errors": [...]}.
@@ -268,7 +309,12 @@ def read_timetable_excel(file_content: bytes, filename: str = "timetable.xlsx") 
                 raw_end = cell(values, "end_time")
                 raw_shift = cell(values, "shift")
 
-                if raw_start is not None and str(raw_start).strip() != "" and raw_end is not None and str(raw_end).strip() != "":
+                if (
+                    raw_start is not None
+                    and str(raw_start).strip() != ""
+                    and raw_end is not None
+                    and str(raw_end).strip() != ""
+                ):
                     start_time = parse_time(raw_start)
                     end_time = parse_time(raw_end)
                 elif raw_shift is not None and str(raw_shift).strip() != "":
@@ -289,11 +335,11 @@ def read_timetable_excel(file_content: bytes, filename: str = "timetable.xlsx") 
                 student_count: int | None = None
                 if raw_count is not None and str(raw_count).strip() != "":
                     try:
-                        student_count = int(float(raw_count))
+                        student_count = _parse_integer_value(raw_count)
                         if student_count <= 0:
-                            raise ValueError()
+                            raise ValueError
                     except ValueError:
-                        raise ValueError("Sĩ số sinh viên phải là số nguyên dương")
+                        raise ValueError("Sĩ số sinh viên phải là số nguyên dương") from None
 
                 raw_type = cell(values, "required_room_type")
                 required_room_type = (
