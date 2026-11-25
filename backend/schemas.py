@@ -39,6 +39,7 @@ class RoomResponse(RoomCreate):
 class CourseClassCreate(BaseModel):
     class_code: str = Field(min_length=1, max_length=30)
     course_name: str = Field(min_length=1, max_length=150)
+    lecturer: str | None = Field(default=None, max_length=100)
     student_count: int = Field(gt=0)
 
     required_room_type: str = Field(
