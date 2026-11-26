@@ -129,6 +129,46 @@ def health_check():
 # HÀM KIỂM TRA RÀNGNG BUỘC DÙNG CHUNG
 # ==========================================
 
+def _find_lecturer_schedule_conflict(
+    db: Session,
+    course_class: CourseClass,
+    weekday: int,
+    start_time: time,
+    end_time: time,
+    ignore_session_id: Optional[int] = None,
+) -> Optional[str]:
+    """Kiểm tra giảng viên có lịch dạy trùng giờ, kể cả buổi chưa có phòng."""
+
+    lecturer = (course_class.lecturer or "").strip()
+    if not lecturer:
+        return None
+
+    query = (
+        db.query(TimetableSession, CourseClass)
+        .join(CourseClass, CourseClass.id == TimetableSession.class_id)
+        .filter(
+            TimetableSession.weekday == weekday,
+            TimetableSession.start_time < end_time,
+            TimetableSession.end_time > start_time,
+        )
+    )
+
+    if ignore_session_id is not None:
+        query = query.filter(TimetableSession.id != ignore_session_id)
+
+    for existing_session, existing_class in query.all():
+        existing_lecturer = (existing_class.lecturer or "").strip()
+
+        if (
+            existing_lecturer
+            and existing_lecturer.casefold() == lecturer.casefold()
+        ):
+            return (
+                f"Giảng viên {lecturer} đã có lịch trùng giờ "
+                f"với lớp {existing_class.class_code}"
+            )
+
+    return None
 def _validate_session_placement(
     db: Session,
     course_class: CourseClass,
@@ -139,21 +179,40 @@ def _validate_session_placement(
     ignore_session_id: Optional[int] = None,
     allow_overload: bool = False,
 ) -> Optional[Room]:
-    # 1. Kiểm tra chính lớp học phần đó không bị trùng giờ với buổi khác của cùng lớp
+        # 1. Kiểm tra chính lớp học phần đó không bị trùng giờ
     class_conflict_q = db.query(TimetableSession).filter(
         TimetableSession.class_id == course_class.id,
         TimetableSession.weekday == weekday,
         TimetableSession.start_time < end_time,
         TimetableSession.end_time > start_time,
     )
+
     if ignore_session_id is not None:
-        class_conflict_q = class_conflict_q.filter(TimetableSession.id != ignore_session_id)
+        class_conflict_q = class_conflict_q.filter(
+            TimetableSession.id != ignore_session_id
+        )
+
     if class_conflict_q.first() is not None:
         raise HTTPException(
             status_code=409,
             detail=f"Lớp {course_class.class_code} đã có lịch học trùng vào khung giờ này",
         )
 
+    # 2. Kiểm tra giảng viên có bị trùng lịch không
+    lecturer_conflict = _find_lecturer_schedule_conflict(
+        db=db,
+        course_class=course_class,
+        weekday=weekday,
+        start_time=start_time,
+        end_time=end_time,
+        ignore_session_id=ignore_session_id,
+    )
+
+    if lecturer_conflict:
+        raise HTTPException(
+            status_code=409,
+            detail=lecturer_conflict,
+        )
     if room_id is None:
         return None
 
@@ -725,6 +784,7 @@ async def import_timetable_excel(
     created_classes_cache: dict[str, CourseClass] = {}
     errors: list[dict] = []
 
+
     for row_number, row in enumerate(result["rows"], start=2):
         course_class: Optional[CourseClass] = None
         c_code = row.get("class_code")
@@ -805,6 +865,7 @@ async def import_timetable_excel(
             )
             continue
 
+
         room: Optional[Room] = None
         room_code = row["room_code"]
         if room_code:
@@ -868,6 +929,7 @@ async def import_timetable_excel(
                 room_id=room.id if room is not None else None,
             )
         )
+
 
     if errors:
         db.rollback()
